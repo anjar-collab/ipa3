@@ -2,10 +2,20 @@
   "name": "web",
   "version": "1.0.0",
   "description": "",
-  "main": "intro.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "build": "node scripts/build.js",
+    "migrate": "node scripts/migrate-sqlite-to-postgres.js",
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.879.0",
+    "@aws-sdk/s3-request-presigner": "^3.879.0",
+    "pg": "^8.16.3"
   },
   "repository": {
     "type": "git",

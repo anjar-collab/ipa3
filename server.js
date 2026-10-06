@@ -1,30 +1,31 @@
 #!/usr/bin/env node
 /* ===========================================================================
-   server.js - DATABASE + HOSTING untuk Buku Tahunan Digital (alumni1.html)
+   server.js - API Buku Tahunan Digital (local Node.js + Vercel)
    ---------------------------------------------------------------------------
    CARA PAKAI
      1. Pastikan Node.js terpasang (versi 22.5 ke atas, disarankan 24).
      2. Dari folder ini jalankan:      node server.js
         atau double-click             start-server.bat
-     3. Buka                         http://localhost:8080/alumni1.html
+     3. Buka                         http://localhost:3000/
 
    APA YANG DISIMPAN (database)
-     data/alumni.db     -> database SQLite: metadata foto, video, dan data siswa
-     data/uploads/      -> berkas foto & video asli
+     PostgreSQL cloud  -> metadata media dan data siswa
+     Object storage    -> foto, video, dan poster
 
-   Frontend (alumni1.html) mendeteksi server ini otomatis lewat /api/health.
+   Frontend (alumni2.html) mendeteksi server ini otomatis lewat /api/health.
    Kalau server aktif, semua admin & pengunjung memakai database yang sama,
    jadi video/foto yang diunggah langsung terlihat oleh semua orang.
    Kalau server tidak aktif, halaman otomatis memakai database browser
    (IndexedDB) sehingga tetap berfungsi.
 
-   PENGATURAN (opsional, lewat environment variable)
+   PENGATURAN (lewat environment variable)
      PORT=8080            porta server
-     HOST=0.0.0.0         buka untuk perangkat lain di jaringan (mis. HP)
-     ADMIN_CODE=smakam    kode admin, samakan dengan ADMIN_CODE di alumni1.html
+     DATABASE_URL=...     koneksi PostgreSQL cloud
+     ADMIN_CODE=...       kode login admin (hanya tersimpan di server)
+     JWT_SECRET=...       kunci token admin
+     S3_*                 konfigurasi object storage S3-compatible
      MAX_UPLOAD_MB=3072   batas ukuran satu video (default 3 GB)
 
-   Tidak perlu `npm install`: semua memakai modul bawaan Node (node:sqlite).
    =========================================================================== */
 
 'use strict';
@@ -33,6 +34,14 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { Pool } = require('pg');
+const {
+  S3Client,
+  PutObjectCommand,
+  HeadObjectCommand,
+  DeleteObjectCommand
+} = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 /* Load local secrets without overwriting environment variables supplied by the host. */
 const ENV_FILE = path.join(__dirname, '.env');
@@ -48,76 +57,91 @@ if (fs.existsSync(ENV_FILE)) {
   });
 }
 
-let DatabaseSync = null;
-try {
-  ({ DatabaseSync } = require('node:sqlite'));
-} catch (err) {
-  console.error('\n[!] Node.js ini belum punya modul "node:sqlite".');
-  console.error('    Gunakan Node.js 22.5 atau lebih baru (disarankan Node 24).');
-  console.error('    Unduh: https://nodejs.org\n');
-  process.exit(1);
-}
-
 /* ---------------------------------------------------------------- konfigurasi */
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-const INTRO_TTS_CACHE_DIR = path.join(DATA_DIR, 'intro-tts-cache');
-const DB_FILE = path.join(DATA_DIR, 'alumni.db');
+const INTRO_TTS_CACHE_DIR = process.env.VERCEL
+  ? path.join('/tmp', 'intro-tts-cache')
+  : path.join(DATA_DIR, 'intro-tts-cache');
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
-const ADMIN_CODE = process.env.ADMIN_CODE || 'smakam';
 const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 3072) * 1024 * 1024;
 const MAX_KV = 64 * 1024 * 1024;
+const CORS_ORIGINS = new Set((process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(origin => origin.trim().replace(/\/+$/, ''))
+  .filter(Boolean));
+let pool;
+let s3;
+let schemaReady;
 const introTtsRequests = new Map();
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(INTRO_TTS_CACHE_DIR, { recursive: true });
 
 /* ------------------------------------------------------------------- database */
-const db = new DatabaseSync(DB_FILE);
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS media (
-    id        TEXT PRIMARY KEY,
-    kind      TEXT NOT NULL,
-    caption   TEXT,
-    name      TEXT,
-    mime      TEXT,
-    size      INTEGER DEFAULT 0,
-    width     INTEGER DEFAULT 0,
-    height    INTEGER DEFAULT 0,
-    duration  REAL    DEFAULT 0,
-    file      TEXT,
-    poster    TEXT,
-    ts        INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS kv (
-    key   TEXT PRIMARY KEY,
-    value TEXT,
-    ts    INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind, ts DESC);
-`);
+function getPool() {
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL belum diatur.');
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === 'disable' ? false : { rejectUnauthorized: false },
+      max: Number(process.env.PG_POOL_MAX || (process.env.VERCEL ? 1 : 10)),
+      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 30000
+    });
+  }
+  return pool;
+}
 
-const q = {
-  insertMedia: db.prepare(
-    `INSERT OR REPLACE INTO media (id, kind, caption, name, mime, size, width, height, duration, file, poster, ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ),
-  allMedia: db.prepare('SELECT * FROM media ORDER BY ts DESC'),
-  mediaByKind: db.prepare('SELECT * FROM media WHERE kind = ? ORDER BY ts DESC'),
-  mediaById: db.prepare('SELECT * FROM media WHERE id = ?'),
-  setPoster: db.prepare("UPDATE media SET poster = '1' WHERE id = ?"),
-  delMedia: db.prepare('DELETE FROM media WHERE id = ?'),
-  getKv: db.prepare('SELECT value FROM kv WHERE key = ?'),
-  putKv: db.prepare('INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?, ?, ?)'),
-  delKv: db.prepare('DELETE FROM kv WHERE key = ?'),
-  allKvKeys: db.prepare('SELECT key FROM kv'),
-  sumSize: db.prepare('SELECT COALESCE(SUM(size),0) AS total FROM media'),
-  countKind: db.prepare('SELECT COUNT(*) AS n FROM media WHERE kind = ?')
-};
+function getS3() {
+  const required = ['S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_PUBLIC_URL'];
+  const missing = required.filter(name => !process.env[name]);
+  if (missing.length) throw new Error('Konfigurasi object storage belum lengkap: ' + missing.join(', '));
+  if (!s3) {
+    s3 = new S3Client({
+      region: process.env.S3_REGION || 'auto',
+      endpoint: process.env.S3_ENDPOINT || undefined,
+      forcePathStyle: process.env.S3_FORCE_PATH_STYLE !== 'false',
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY
+      }
+    });
+  }
+  return s3;
+}
+
+async function ensureSchema() {
+  if (!schemaReady) {
+    schemaReady = getPool().query(`
+      CREATE TABLE IF NOT EXISTS media (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        caption TEXT,
+        name TEXT,
+        mime TEXT,
+        size BIGINT DEFAULT 0,
+        width INTEGER DEFAULT 0,
+        height INTEGER DEFAULT 0,
+        duration DOUBLE PRECISION DEFAULT 0,
+        file TEXT,
+        poster TEXT,
+        ts BIGINT
+      );
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        ts BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind, ts DESC);
+    `).catch(err => {
+      schemaReady = null;
+      throw err;
+    });
+  }
+  await schemaReady;
+}
 
 /* ------------------------------------------------------------------- utilitas */
 const MIME = {
@@ -170,8 +194,23 @@ function safeText(value, max) {
   return String(value == null ? '' : value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max || 300);
 }
 
+function signAdminToken(expiry) {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET).update(String(expiry)).digest('hex');
+}
+
+function issueAdminToken() {
+  const expiry = Date.now() + 12 * 60 * 60 * 1000;
+  return expiry + '.' + signAdminToken(expiry);
+}
+
 function isAdmin(req) {
-  return safeText(header(req, 'x-admin-code'), 100) === ADMIN_CODE;
+  const [expiryText, signature, extra] = header(req, 'x-admin-token').split('.');
+  if (!expiryText || !signature || extra || !/^\d+$/.test(expiryText)) return false;
+  const expiry = Number(expiryText);
+  if (!Number.isSafeInteger(expiry) || expiry <= Date.now()) return false;
+  const expected = Buffer.from(signAdminToken(expiry), 'hex');
+  const supplied = Buffer.from(signature, 'hex');
+  return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
 }
 
 function sendJson(res, status, body) {
@@ -186,6 +225,35 @@ function sendJson(res, status, body) {
 
 function sendError(res, status, message) {
   sendJson(res, status, { error: message });
+}
+
+function publicObjectUrl(key) {
+  const base = process.env.S3_PUBLIC_URL.replace(/\/+$/, '') + '/';
+  return new URL(key.split('/').map(encodeURIComponent).join('/'), base).toString();
+}
+
+async function signUpload(key, mime) {
+  const command = new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    ContentType: mime
+  });
+  return getSignedUrl(getS3(), command, { expiresIn: 900 });
+}
+
+async function objectInfo(key) {
+  return getS3().send(new HeadObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: key
+  }));
+}
+
+async function deleteObject(key) {
+  if (!key) return;
+  await getS3().send(new DeleteObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: key
+  }));
 }
 
 function sendIntroAudio(res, audio) {
@@ -431,36 +499,44 @@ function mediaRowToJson(row) {
   };
 }
 
-function apiCounts() {
-  return { photo: Number(q.countKind.get('photo').n), video: Number(q.countKind.get('video').n) };
+async function apiCounts() {
+  const result = await getPool().query('SELECT kind, COUNT(*) AS n FROM media GROUP BY kind');
+  return result.rows.reduce((counts, row) => {
+    counts[row.kind] = Number(row.n);
+    return counts;
+  }, { photo: 0, video: 0 });
 }
 
 async function handleApi(req, res, url) {
   const seg = url.pathname.split('/').filter(Boolean);      // ['api', ...]
   const section = seg[1] || '';
   const method = req.method;
+  const database = getPool();
 
   if (section === 'intro-tts') return handleIntroTts(req, res);
 
   if (section === 'health') {
     return sendJson(res, 200, {
       ok: true,
-      service: 'buku-tahunan-db',
+      service: 'buku-tahunan-api',
       node: process.version,
-      db: DB_FILE,
-      uploads: UPLOAD_DIR,
       maxUploadBytes: MAX_UPLOAD,
       maxKvBytes: MAX_KV,
-      counts: apiCounts()
+      storage: 'postgresql+s3',
+      counts: await apiCounts()
     });
   }
 
   if (section === 'stats') {
+    const [size, counts] = await Promise.all([
+      database.query('SELECT COALESCE(SUM(size),0) AS total FROM media'),
+      apiCounts()
+    ]);
     return sendJson(res, 200, {
       ok: true,
-      usedBytes: Number(q.sumSize.get().total) || 0,
+      usedBytes: Number(size.rows[0].total) || 0,
       maxUploadBytes: MAX_UPLOAD,
-      counts: apiCounts()
+      counts
     });
   }
 
@@ -470,8 +546,10 @@ async function handleApi(req, res, url) {
 
     if (method === 'GET' && !id) {
       const kind = url.searchParams.get('kind');
-      const rows = kind ? q.mediaByKind.all(kind) : q.allMedia.all();
-      return sendJson(res, 200, { ok: true, items: rows.map(mediaRowToJson) });
+      const rows = kind
+        ? await database.query('SELECT * FROM media WHERE kind = $1 ORDER BY ts DESC', [kind])
+        : await database.query('SELECT * FROM media ORDER BY ts DESC');
+      return sendJson(res, 200, { ok: true, items: rows.rows.map(mediaRowToJson) });
     }
 
     if (method === 'POST' && !id) {
@@ -481,70 +559,90 @@ async function handleApi(req, res, url) {
       const mime = safeText(header(req, 'content-type'), 120) || 'application/octet-stream';
       const idNew = safeText(header(req, 'x-id'), 80) ||
         Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(idNew)) return sendError(res, 400, 'ID media tidak valid.');
       const name = safeText(header(req, 'x-name'), 200) || idNew;
       const caption = safeText(header(req, 'x-caption'), 300) || name.replace(/\.[^/.]+$/, '');
       const width = Number(header(req, 'x-width')) || 0;
       const height = Number(header(req, 'x-height')) || 0;
       const duration = Number(header(req, 'x-duration')) || 0;
-
-      const dir = path.join(UPLOAD_DIR, kind);
-      fs.mkdirSync(dir, { recursive: true });
       const ext = path.extname(name) || EXT_BY_MIME[mime] || (kind === 'video' ? '.mp4' : '.jpg');
       const fileName = idNew + ext.replace(/[^.a-zA-Z0-9]/g, '');
-      const dest = path.join(dir, fileName);
-
-      let size;
+      const objectKey = path.posix.join(kind, fileName);
       try {
-        size = await readStreamToFile(req, dest, MAX_UPLOAD);
+        await database.query(
+          `INSERT INTO media (id, kind, caption, name, mime, size, width, height, duration, file, poster, ts)
+           VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, NULL, $10)`,
+          [idNew, kind, caption, name, mime, width, height, duration, objectKey, Date.now()]
+        );
       } catch (err) {
-        return sendError(res, err.status || 500, err.message || 'Gagal menyimpan berkas.');
+        if (err.code === '23505') return sendError(res, 409, 'ID media sudah digunakan.');
+        throw err;
       }
-      if (size === 0) {
-        try { fs.unlinkSync(dest); } catch (e) { /* ignore */ }
-        return sendError(res, 400, 'Berkas kosong.');
+      try {
+        const uploadUrl = await signUpload(objectKey, mime);
+        return sendJson(res, 201, { ok: true, id: idNew, size: 0, uploadUrl });
+      } catch (err) {
+        await database.query('DELETE FROM media WHERE id = $1', [idNew]);
+        throw err;
       }
+    }
 
-      const hasPoster = safeText(header(req, 'x-poster'), 4) === '1';
-      q.insertMedia.run(idNew, kind, caption, name, mime, size, width, height, duration,
-        path.posix.join(kind, fileName), hasPoster ? '1' : null, Date.now());
-      return sendJson(res, 201, { ok: true, id: idNew, size });
+    if (method === 'POST' && id && sub === 'complete') {
+      if (!isAdmin(req)) return sendError(res, 401, 'Kode admin salah, unggahan ditolak.');
+      const result = await database.query('SELECT file FROM media WHERE id = $1', [id]);
+      if (!result.rowCount) return sendError(res, 404, 'Media tidak ditemukan');
+      const info = await objectInfo(result.rows[0].file);
+      const size = Number(info.ContentLength) || 0;
+      if (!size) return sendError(res, 400, 'Berkas kosong.');
+      if (size > MAX_UPLOAD) return sendError(res, 413, 'Ukuran berkas melebihi batas ' + formatBytes(MAX_UPLOAD) + '.');
+      await database.query('UPDATE media SET size = $1, ts = $2 WHERE id = $3', [size, Date.now(), id]);
+      return sendJson(res, 200, { ok: true, id, size });
     }
 
     if (method === 'PUT' && id && sub === 'poster') {
       if (!isAdmin(req)) return sendError(res, 401, 'Kode admin salah, poster ditolak.');
-      const row = q.mediaById.get(id);
-      if (!row) return sendError(res, 404, 'Media tidak ditemukan');
-      const dest = path.join(UPLOAD_DIR, row.file.replace(/\.[^/.]+$/, '') + '-poster.jpg');
-      try {
-        const size = await readStreamToFile(req, dest, 4 * 1024 * 1024);
-        q.setPoster.run(id);
-        return sendJson(res, 200, { ok: true, size });
-      } catch (err) {
-        return sendError(res, err.status || 500, err.message || 'Gagal menyimpan poster');
-      }
+      const result = await database.query('SELECT id FROM media WHERE id = $1', [id]);
+      if (!result.rowCount) return sendError(res, 404, 'Media tidak ditemukan');
+      const objectKey = 'poster/' + id + '-poster.jpg';
+      const uploadUrl = await signUpload(objectKey, 'image/jpeg');
+      return sendJson(res, 200, { ok: true, uploadUrl, objectKey });
+    }
+
+    if (method === 'POST' && id && sub === 'poster' && seg[4] === 'complete') {
+      if (!isAdmin(req)) return sendError(res, 401, 'Kode admin salah, unggahan ditolak.');
+      const result = await database.query('SELECT id FROM media WHERE id = $1', [id]);
+      if (!result.rowCount) return sendError(res, 404, 'Media tidak ditemukan');
+      const objectKey = 'poster/' + id + '-poster.jpg';
+      const info = await objectInfo(objectKey);
+      const size = Number(info.ContentLength) || 0;
+      if (!size) return sendError(res, 400, 'Poster kosong.');
+      if (size > 4 * 1024 * 1024) return sendError(res, 413, 'Ukuran poster melebihi batas 4 MB.');
+      await database.query('UPDATE media SET poster = $1 WHERE id = $2', [objectKey, id]);
+      return sendJson(res, 200, { ok: true, size });
     }
 
     if (method === 'GET' && id) {
-      const row = q.mediaById.get(id);
+      const result = await database.query('SELECT * FROM media WHERE id = $1', [id]);
+      const row = result.rows[0];
       if (!row) return sendError(res, 404, 'Media tidak ditemukan');
-      if (sub === 'poster' && row.poster) {
-        const posterPath = path.join(UPLOAD_DIR, row.file.replace(/\.[^/.]+$/, '') + '-poster.jpg');
-        if (fs.existsSync(posterPath)) return sendFile(req, res, posterPath, 'image/jpeg');
-        return sendError(res, 404, 'Poster tidak ada');
-      }
-      return sendFile(req, res, path.join(UPLOAD_DIR, row.file), row.mime);
+      if (!sub) return sendJson(res, 200, mediaRowToJson(row));
+      const objectKey = sub === 'poster' ? row.poster : row.file;
+      if (!objectKey) return sendError(res, 404, sub === 'poster' ? 'Poster tidak ada' : 'Berkas tidak ditemukan');
+      if (sub !== 'poster' && sub !== 'raw') return sendError(res, 404, 'Endpoint tidak dikenal');
+      res.writeHead(302, {
+        Location: publicObjectUrl(objectKey),
+        'Cache-Control': 'public, max-age=3600'
+      });
+      return res.end();
     }
 
     if (method === 'DELETE' && id) {
       if (!isAdmin(req)) return sendError(res, 401, 'Kode admin salah, penghapusan ditolak.');
-      const row = q.mediaById.get(id);
+      const result = await database.query('SELECT file, poster FROM media WHERE id = $1', [id]);
+      const row = result.rows[0];
       if (!row) return sendError(res, 404, 'Media tidak ditemukan');
-      q.delMedia.run(id);
-      try { fs.unlinkSync(path.join(UPLOAD_DIR, row.file)); } catch (e) { /* ignore */ }
-      try {
-        const posterPath = path.join(UPLOAD_DIR, row.file.replace(/\.[^/.]+$/, '') + '-poster.jpg');
-        if (fs.existsSync(posterPath)) fs.unlinkSync(posterPath);
-      } catch (e) { /* ignore */ }
+      await Promise.all([deleteObject(row.file), deleteObject(row.poster)]);
+      await database.query('DELETE FROM media WHERE id = $1', [id]);
       return sendJson(res, 200, { ok: true });
     }
 
@@ -556,13 +654,16 @@ async function handleApi(req, res, url) {
 
     if (method === 'GET' && !key) {
       const prefix = url.searchParams.get('prefix') || '';
-      const keys = q.allKvKeys.all().map(r => r.key).filter(k => !prefix || k.startsWith(prefix));
-      return sendJson(res, 200, { ok: true, keys });
+      const result = await database.query(
+        'SELECT key FROM kv WHERE $1 = \'\' OR LEFT(key, LENGTH($1)) = $1 ORDER BY key',
+        [prefix]
+      );
+      return sendJson(res, 200, { ok: true, keys: result.rows.map(row => row.key) });
     }
     if (method === 'GET' && key) {
-      const row = q.getKv.get(key);
-      if (!row) return sendError(res, 404, 'Key tidak ditemukan');
-      const payload = Buffer.from(String(row.value), 'utf8');
+      const result = await database.query('SELECT value FROM kv WHERE key = $1', [key]);
+      if (!result.rowCount) return sendError(res, 404, 'Key tidak ditemukan');
+      const payload = Buffer.from(String(result.rows[0].value), 'utf8');
       res.writeHead(200, {
         'Content-Type': 'text/plain; charset=utf-8',
         'Content-Length': payload.length,
@@ -578,21 +679,36 @@ async function handleApi(req, res, url) {
       } catch (err) {
         return sendError(res, err.status || 400, err.message || 'Data gagal dibaca');
       }
-      q.putKv.run(key, value, Date.now());
+      await database.query(
+        `INSERT INTO kv (key, value, ts) VALUES ($1, $2, $3)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, ts = EXCLUDED.ts`,
+        [key, value, Date.now()]
+      );
       return sendJson(res, 200, { ok: true });
     }
     if (method === 'DELETE' && key) {
       if (!isAdmin(req)) return sendError(res, 401, 'Kode admin salah, penghapusan ditolak.');
-      q.delKv.run(key);
+      await database.query('DELETE FROM kv WHERE key = $1', [key]);
       return sendJson(res, 200, { ok: true });
     }
     return sendError(res, 405, 'Metode tidak didukung untuk /api/kv');
   }
 
   if (section === 'admin' && method === 'POST') {
-    let body = '';
-    try { body = await readTextBody(req, 4096); } catch (e) { /* ignore */ }
-    if (safeText(body, 100) === ADMIN_CODE) return sendJson(res, 200, { ok: true });
+    if (!process.env.ADMIN_CODE || !process.env.JWT_SECRET) {
+      return sendError(res, 503, 'Autentikasi admin belum dikonfigurasi.');
+    }
+    let body;
+    try {
+      body = await readTextBody(req, 4096);
+    } catch (err) {
+      return sendError(res, err.status || 400, 'Permintaan login tidak valid.');
+    }
+    const supplied = Buffer.from(safeText(body, 256));
+    const expected = Buffer.from(process.env.ADMIN_CODE);
+    if (supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)) {
+      return sendJson(res, 200, { ok: true, token: issueAdminToken() });
+    }
     return sendError(res, 401, 'Kode admin salah');
   }
 
@@ -601,38 +717,50 @@ async function handleApi(req, res, url) {
 
 /* ------------------------------------------------------------- berkas statis */
 function serveStatic(req, res, url) {
-  let rel = decodeURIComponent(url.pathname);
-  if (/^\.env(?:\.|$)/i.test(path.basename(rel))) {
-    return sendError(res, 404, 'Berkas tidak ditemukan');
+  let rel;
+  try {
+    rel = decodeURIComponent(url.pathname);
+  } catch (err) {
+    return sendError(res, 400, 'URL tidak valid');
   }
-  if (rel === '/' || rel === '') rel = '/alumni1.html';
-  const target = path.resolve(path.join(ROOT, rel));
-  const rootResolved = path.resolve(ROOT);
-  if (target !== rootResolved && !target.startsWith(rootResolved + path.sep)) {
-    return sendError(res, 403, 'Akses ditolak');
+  if (rel === '/' || rel === '') rel = '/alumni2.html';
+  const allowed = new Set(['/alumni2.html', '/intro.js', '/intro.css', '/api-config.js']);
+  const musicPrefix = '/music/';
+  if (rel.startsWith(musicPrefix)) {
+    const musicPath = path.resolve(ROOT, 'music', rel.slice(musicPrefix.length));
+    const musicRoot = path.resolve(ROOT, 'music') + path.sep;
+    if (!musicPath.startsWith(musicRoot)) return sendError(res, 403, 'Akses ditolak');
+    let stat;
+    try { stat = fs.statSync(musicPath); } catch (err) { return sendError(res, 404, 'Berkas tidak ditemukan'); }
+    if (!stat.isFile()) return sendError(res, 404, 'Berkas tidak ditemukan');
+    return sendFile(req, res, musicPath, MIME[path.extname(musicPath).toLowerCase()] || 'application/octet-stream');
   }
-  let stat = null;
-  try { stat = fs.statSync(target); } catch (e) { /* ignore */ }
-  if (stat && stat.isDirectory()) {
-    const idx = path.join(target, 'index.html');
-    if (fs.existsSync(idx)) return sendFile(req, res, idx, MIME['.html']);
-    return sendError(res, 404, 'Halaman tidak ditemukan');
-  }
-  if (!stat) {
-    const asHtml = path.join(target, target + '.html');
-    if (fs.existsSync(asHtml)) return sendFile(req, res, asHtml, MIME['.html']);
-    return sendError(res, 404, 'Berkas tidak ditemukan');
-  }
-  sendFile(req, res, target, MIME[path.extname(target).toLowerCase()] || 'application/octet-stream');
+  if (!allowed.has(rel)) return sendError(res, 404, 'Berkas tidak ditemukan');
+  const target = path.join(ROOT, rel.slice(1));
+  let stat;
+  try { stat = fs.statSync(target); } catch (err) { return sendError(res, 404, 'Berkas tidak ditemukan'); }
+  if (!stat.isFile()) return sendError(res, 404, 'Berkas tidak ditemukan');
+  return sendFile(req, res, target, MIME[path.extname(target).toLowerCase()] || 'application/octet-stream');
 }
 
-/* ------------------------------------------------------------------- server */
-const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', header(req, 'origin') || '*');
+function configureCors(req, res) {
+  const origin = header(req, 'origin');
+  if (origin) {
+    if (!CORS_ORIGINS.has(origin.replace(/\/+$/, ''))) {
+      sendError(res, 403, 'Origin tidak diizinkan.');
+      return false;
+    }
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,HEAD,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Id,X-Kind,X-Caption,X-Name,X-Width,X-Height,X-Duration,X-Poster,X-Admin-Code');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Id,X-Kind,X-Caption,X-Name,X-Width,X-Height,X-Duration,X-Poster,X-Admin-Token');
   res.setHeader('Access-Control-Max-Age', '86400');
+  return true;
+}
 
+async function handleRequest(req, res) {
+  if (!configureCors(req, res)) return;
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
@@ -640,8 +768,8 @@ const server = http.createServer((req, res) => {
 
   let url;
   try {
-    url = new URL(req.url, 'http://' + (header(req, 'host') || 'localhost'));
-  } catch (e) {
+    url = new URL(req.url, 'https://application.invalid');
+  } catch (err) {
     return sendError(res, 400, 'URL tidak valid');
   }
 
@@ -650,45 +778,57 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  if (url.pathname.startsWith('/api/')) {
-    return handleApi(req, res, url).catch(err => {
-      console.error('[api]', err);
-      sendError(res, err.status || 500, err.message || 'Terjadi kesalahan di server');
-    });
+  if (url.pathname === '/health' && req.method === 'GET') {
+    return sendJson(res, 200, { status: 'ok' });
   }
-  serveStatic(req, res, url);
-});
 
-server.on('error', err => {
-  if (err.code === 'EADDRINUSE') {
-    console.error('\n[!] Porta ' + PORT + ' sudah dipakai program lain.');
-    console.error('    Jalankan dengan porta lain:  set PORT=8081 && node server.js\n');
+  if (url.pathname.startsWith('/api/')) {
+    try {
+      await ensureSchema();
+      await handleApi(req, res, url);
+    } catch (err) {
+      console.error('[api]', err);
+      sendError(res, err.status || 500, err.status ? err.message : 'Terjadi kesalahan di server.');
+    }
+    return;
+  }
+  return serveStatic(req, res, url);
+}
+
+function validateServerConfig() {
+  if (!process.env.DATABASE_URL) throw new Error('Atur DATABASE_URL sebelum menjalankan server.');
+  if (!process.env.ADMIN_CODE || process.env.ADMIN_CODE.length < 16) {
+    throw new Error('ADMIN_CODE wajib berisi setidaknya 16 karakter.');
+  }
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    throw new Error('JWT_SECRET wajib berisi setidaknya 32 karakter.');
+  }
+  getS3();
+}
+
+if (require.main === module) {
+  try {
+    validateServerConfig();
+  } catch (err) {
+    console.error('[config]', err.message);
     process.exit(1);
   }
-  throw err;
-});
+  const server = http.createServer(handleRequest);
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      console.error('\n[!] Porta ' + PORT + ' sudah dipakai program lain.');
+      process.exit(1);
+    }
+    throw err;
+  });
+  ensureSchema().then(() => {
+    server.listen(PORT, HOST, () => {
+      console.log('Buku Tahunan Digital berjalan di port ' + PORT + ' dengan PostgreSQL dan object storage.');
+    });
+  }).catch(err => {
+    console.error('[database]', err.message);
+    process.exit(1);
+  });
+}
 
-server.listen(PORT, HOST, () => {
-  const used = Number(q.sumSize.get().total) || 0;
-  const counts = apiCounts();
-  console.log('');
-  console.log('  ========================================================');
-  console.log('   BUKU TAHUNAN DIGITAL - DATABASE SERVER');
-  console.log('  ========================================================');
-  console.log('   Halaman   : http://localhost:' + PORT + '/alumni1.html');
-  if (HOST === '0.0.0.0') console.log('   Jaringan   : http://<IP-komputer-ini>:' + PORT + '/alumni1.html');
-  console.log('   Database   : ' + DB_FILE);
-  console.log('   Unggahan   : ' + UPLOAD_DIR);
-  console.log('   Isi DB     : ' + counts.photo + ' foto, ' + counts.video + ' video (' + formatBytes(used) + ')');
-  console.log('   Batas file : ' + formatBytes(MAX_UPLOAD) + ' per video');
-  console.log('   Kode admin : ' + ADMIN_CODE);
-  console.log('  -------------------------------------------------------');
-  console.log('   Tekan Ctrl+C untuk menghentikan server.');
-  console.log('');
-});
-
-process.on('SIGINT', () => {
-  console.log('\nServer dihentikan.');
-  try { db.close(); } catch (e) { /* ignore */ }
-  process.exit(0);
-});
+module.exports = { handler: handleRequest, ensureSchema, getPool, getS3 };

@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&amp;family=Source+Sans+3:wght@400;500;600;700&amp;family=Caveat:wght@500;600&amp;display=swap" rel="stylesheet">
 <link rel="stylesheet" href="intro.css?v=2">
+<script src="api-config.js"></script>
 <style>
   :root{
     --cream:#F7F3EC;
@@ -1443,7 +1444,7 @@
    DULU foto & video disimpan sebagai teks base64 (data URL) di localStorage,
    sehingga hanya muat 2-5 MB dan video besar mustahil masuk.
    SEKARANG:
-     server    -> database server (SQLite + folder uploads). Semua admin dan
+     server    -> PostgreSQL cloud + object storage. Semua admin dan
                   pengunjung memakai data yang sama, video bisa ratusan MB.
      IndexedDB -> database browser. Foto & video disimpan sebagai Blob (bukan
                   base64) jadi hemat ~33% dan tidak lagi dibatasi 2-5 MB.
@@ -1454,9 +1455,8 @@
    supaya tidak hilang.
    ========================================================================== */
 
-// Kode admin. Nilai yang sama juga dipakai server database (lihat server.js).
-const ADMIN_CODE = "smakam";
 const ADMIN_SESSION_KEY = "alumni_admin_session";
+let activeAdminToken = sessionStorage.getItem(ADMIN_SESSION_KEY) || '';
 
 const STORAGE_NS = 'bukuTahunan::';
 const IDB_NAME = 'buku_tahunan_alumni';
@@ -1594,6 +1594,8 @@ function localKeys(){
 
 /* --------------------------------------------------------------- database server */
 function serverBaseUrl(){
+  const configured = window.BUKU_TAHUNAN_API_URL || '';
+  if(configured) return configured.replace(/\/+$/, '');
   try{
     const q = new URLSearchParams(location.search).get('api');
     if(q) return q.replace(/\/+$/, '');
@@ -1625,54 +1627,70 @@ async function apiText(path, options){
   return (await apiRequest(path, options)).text();
 }
 function adminHeaders(extra){
-  return Object.assign({ 'X-Admin-Code': ADMIN_CODE }, extra || {});
+  const headers = activeAdminToken ? { 'X-Admin-Token': activeAdminToken } : {};
+  return Object.assign(headers, extra || {});
 }
-/* Unggah lewat XHR supaya ada progress/upload event untuk berkas besar. */
+/* Berkas besar dikirim langsung ke object storage, melewati batas body Vercel. */
 function headerSafe(value){
   return String(value == null ? '' : value).replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').trim();
 }
-function serverUpload(rec, onProgress){
+function uploadToStorage(blob, uploadUrl, mime, onProgress){
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', server.base + '/api/media', true);
-    xhr.setRequestHeader('Content-Type', rec.mime || 'application/octet-stream');
-    xhr.setRequestHeader('X-Id', headerSafe(rec.id));
-    xhr.setRequestHeader('X-Kind', headerSafe(rec.kind) || 'photo');
-    xhr.setRequestHeader('X-Caption', headerSafe(rec.caption).slice(0, 300));
-    xhr.setRequestHeader('X-Name', headerSafe(rec.name || rec.id).slice(0, 200));
-    xhr.setRequestHeader('X-Width', String(rec.width || 0));
-    xhr.setRequestHeader('X-Height', String(rec.height || 0));
-    xhr.setRequestHeader('X-Duration', String(rec.duration || 0));
-    xhr.setRequestHeader('X-Poster', rec.posterBlob ? '1' : '0');
-    xhr.setRequestHeader('X-Admin-Code', ADMIN_CODE);
+    xhr.open('PUT', uploadUrl, true);
+    xhr.setRequestHeader('Content-Type', mime || 'application/octet-stream');
     if(xhr.upload && onProgress){
       xhr.upload.onprogress = e => {
         if(e.lengthComputable) onProgress(Math.min(98, Math.round(e.loaded / e.total * 100)));
       };
     }
-    xhr.onload = async () => {
+    xhr.onload = () => {
       if(xhr.status < 200 || xhr.status >= 300){
-        let msg = 'Database server menolak unggahan (' + xhr.status + ')';
-        try{ const j = JSON.parse(xhr.responseText); if(j && j.error) msg = j.error; }catch(e){}
-        return reject(new Error(msg));
+        return reject(new Error('Object storage menolak unggahan (' + xhr.status + ').'));
       }
-      let out = { ok:true, id:rec.id };
-      try{ out = JSON.parse(xhr.responseText) || out; }catch(e){}
-      if(rec.posterBlob){
-        try{
-          await apiRequest('/api/media/' + encodeURIComponent(rec.id) + '/poster', {
-            method:'PUT',
-            headers: adminHeaders({ 'Content-Type':'image/jpeg' }),
-            body: rec.posterBlob
-          });
-        }catch(e){ /* poster gagal tidak masalah, videonya tetap tersimpan */ }
-      }
-      resolve(out);
+      resolve();
     };
-    xhr.onerror = () => reject(new Error('Tidak bisa menghubungi database server'));
-    xhr.ontimeout = () => reject(new Error('Koneksi ke database server habis waktu'));
-    xhr.send(rec.blob);
+    xhr.onerror = () => reject(new Error('Tidak bisa menghubungi object storage.'));
+    xhr.ontimeout = () => reject(new Error('Koneksi ke object storage habis waktu.'));
+    xhr.send(blob);
   });
+}
+async function serverUpload(rec, onProgress){
+  const mediaId = headerSafe(rec.id);
+  const init = await apiJson('/api/media', {
+    method:'POST',
+    headers:adminHeaders({
+      'Content-Type':rec.mime || 'application/octet-stream',
+      'X-Id':mediaId,
+      'X-Kind':headerSafe(rec.kind) || 'photo',
+      'X-Caption':headerSafe(rec.caption).slice(0, 300),
+      'X-Name':headerSafe(rec.name || mediaId).slice(0, 200),
+      'X-Width':String(rec.width || 0),
+      'X-Height':String(rec.height || 0),
+      'X-Duration':String(rec.duration || 0)
+    })
+  });
+  await uploadToStorage(rec.blob, init.uploadUrl, rec.mime, onProgress);
+  const result = await apiJson('/api/media/' + encodeURIComponent(mediaId) + '/complete', {
+    method:'POST',
+    headers:adminHeaders()
+  });
+  if(rec.posterBlob){
+    try{
+      const poster = await apiJson('/api/media/' + encodeURIComponent(mediaId) + '/poster', {
+        method:'PUT',
+        headers:adminHeaders()
+      });
+      await uploadToStorage(rec.posterBlob, poster.uploadUrl, 'image/jpeg');
+      await apiRequest('/api/media/' + encodeURIComponent(mediaId) + '/poster/complete', {
+        method:'POST',
+        headers:adminHeaders()
+      });
+    }catch(err){
+      console.warn('Media utama tersimpan, tetapi poster video gagal diunggah:', err);
+    }
+  }
+  return result;
 }
 
 /* -------------------------------------------------- object URL untuk Blob lokal */
@@ -2273,10 +2291,11 @@ document.getElementById('footerLogoImg').src = SCHOOL_LOGO_SRC;
 // mengunggah ke database server. Ganti nilainya di sana kapan saja.
 
 function isAdminActive(){
-  return sessionStorage.getItem(ADMIN_SESSION_KEY) === "1";
+  return Boolean(activeAdminToken);
 }
-function setAdminActive(active){
-  if(active) sessionStorage.setItem(ADMIN_SESSION_KEY, "1");
+function setAdminActive(token){
+  activeAdminToken = token || '';
+  if(activeAdminToken) sessionStorage.setItem(ADMIN_SESSION_KEY, activeAdminToken);
   else sessionStorage.removeItem(ADMIN_SESSION_KEY);
 }
 
@@ -2297,20 +2316,31 @@ function closeAdminModal(){
   adminModalOverlay.classList.remove('open');
 }
 
-function tryAdminLogin(){
+async function tryAdminLogin(){
   const val = adminCodeInput.value.trim();
-  if(val === ADMIN_CODE){
-    setAdminActive(true);
+  adminConfirmBtn.disabled = true;
+  try{
+    const result = await apiJson('/api/admin', {
+      method:'POST',
+      headers:{ 'Content-Type':'text/plain; charset=utf-8' },
+      body:val
+    });
+    if(!result.token) throw new Error('Server tidak memberikan sesi admin yang valid.');
+    setAdminActive(result.token);
     closeAdminModal();
     refreshAdminUI();
-  }else{
-    adminError.textContent = 'Kode admin salah. Coba lagi.';
+  }catch(err){
+    adminError.textContent = err.status === 401
+      ? 'Kode admin salah. Coba lagi.'
+      : 'Login admin gagal: ' + err.message;
     adminCodeInput.focus();
     adminCodeInput.select();
+  }finally{
+    adminConfirmBtn.disabled = false;
   }
 }
 function adminLogout(){
-  setAdminActive(false);
+  setAdminActive('');
   refreshAdminUI();
 }
 
