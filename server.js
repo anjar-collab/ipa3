@@ -66,7 +66,7 @@ const INTRO_TTS_CACHE_DIR = path.join(DATA_DIR, 'intro-tts-cache');
 const DB_FILE = path.join(DATA_DIR, 'alumni.db');
 
 const PORT = Number(process.env.PORT || 8080);
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_CODE = process.env.ADMIN_CODE || 'smakam';
 const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 3072) * 1024 * 1024;
 const MAX_KV = 64 * 1024 * 1024;

@@ -21,9 +21,9 @@ if errorlevel 1 (
 if not exist "data" mkdir "data"
 
 echo Server akan berjalan. Jangan tutup jendela ini selama web dipakai.
-echo Membuka browser ke http://localhost:8081/alumni1.html
+echo Membuka browser ke http://localhost:8080/alumni1.html
 echo.
-start "" http://localhost:8081/alumni1.html
+start "" http://localhost:8080/alumni1.html
 
 node server.js
 
